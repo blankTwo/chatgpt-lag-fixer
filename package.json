@@ -1,0 +1,23 @@
+{
+  "name": "chatgpt-lag-fixer",
+  "version": "0.2.0",
+  "description": "通过裁剪渲染树中的旧消息，解决 ChatGPT 长对话的卡顿和冻结。完全本地运行，无账号、无遥测。",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "gen:icons": "node scripts/gen-icons.mjs",
+    "sync:loader": "node scripts/sync-loader.mjs",
+    "build:wasm": "asc src/wasm/assembly/index.ts --outFile extension/trimmer.wasm --textFile src/wasm/trimmer.wat --exportRuntime --bindings raw --optimizeLevel 3 --shrinkLevel 1",
+    "build:wasm:debug": "asc src/wasm/assembly/index.ts --outFile extension/trimmer.wasm --exportRuntime --bindings raw --debug",
+    "verify": "node scripts/verify-extension.mjs",
+    "build": "npm run gen:icons && npm run sync:loader && npm run build:wasm && npm run verify",
+    "postbuild": "node -e \"import('node:fs').then(fs=>{for(const f of ['extension/trimmer.d.ts','extension/trimmer.js'])fs.rmSync(f,{force:true})})\"",
+    "test": "npm run build:wasm && node --test test/trim.test.mjs test/e2e.test.mjs test/slim.test.mjs test/mem-leak.test.mjs"
+  },
+  "devDependencies": {
+    "assemblyscript": "^0.27.31"
+  },
+  "dependencies": {
+    "@assemblyscript/loader": "^0.27.31"
+  }
+}
