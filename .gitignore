@@ -1,20 +1,16 @@
 node_modules/
 *.log
 .DS_Store
-
-# Reasonix 会话目录（附件/截图等，非项目源码）
 .reasonix/
 
-# 第三方参考资料（用于分析对比，非本项目代码）
-chatgpt_speed_booster-3.0.1.xpi
-ChatGPT_Virtual_Scroll_Engine.min.user.js
-
-# extension/ 内的构建产物（由 npm run build 生成）
+# extension/ 构建产物
 extension/trimmer.wasm
 extension/trimmer.d.ts
 extension/trimmer.js
 extension/icons/
 extension/vendor/
-
-# wasm 文本反汇编（构建副产物）
 src/wasm/trimmer.wat
+
+# 本地发布 / 诊断临时文件
+extension.zip
+tools/

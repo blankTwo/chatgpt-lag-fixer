@@ -1,7 +1,7 @@
 {
   "name": "chatgpt-lag-fixer",
-  "version": "0.2.0",
-  "description": "通过裁剪渲染树中的旧消息，解决 ChatGPT 长对话的卡顿和冻结。完全本地运行，无账号、无遥测。",
+  "version": "0.2.22",
+  "description": "通过裁剪旧消息，降低 ChatGPT 长对话的页面负载与卡顿。",
   "type": "module",
   "license": "MIT",
   "scripts": {
@@ -10,9 +10,12 @@
     "build:wasm": "asc src/wasm/assembly/index.ts --outFile extension/trimmer.wasm --textFile src/wasm/trimmer.wat --exportRuntime --bindings raw --optimizeLevel 3 --shrinkLevel 1",
     "build:wasm:debug": "asc src/wasm/assembly/index.ts --outFile extension/trimmer.wasm --exportRuntime --bindings raw --debug",
     "verify": "node scripts/verify-extension.mjs",
+    "prebuild": "node scripts/bump-version.mjs",
     "build": "npm run gen:icons && npm run sync:loader && npm run build:wasm && npm run verify",
     "postbuild": "node -e \"import('node:fs').then(fs=>{for(const f of ['extension/trimmer.d.ts','extension/trimmer.js'])fs.rmSync(f,{force:true})})\"",
-    "test": "npm run build:wasm && node --test test/trim.test.mjs test/e2e.test.mjs test/slim.test.mjs test/mem-leak.test.mjs"
+    "test": "npm run build:wasm && node --test test/trim.test.mjs test/e2e.test.mjs test/slim.test.mjs test/mem-leak.test.mjs",
+    "posttest": "node -e \"import('node:fs').then(fs=>{for(const f of ['extension/trimmer.d.ts','extension/trimmer.js'])fs.rmSync(f,{force:true})})\"",
+    "clean:release": "node -e \"import('node:fs').then(fs=>{for(const p of ['extension/trimmer.d.ts','extension/trimmer.js','extension.zip','tools'])fs.rmSync(p,{recursive:true,force:true})})\""
   },
   "devDependencies": {
     "assemblyscript": "^0.27.31"

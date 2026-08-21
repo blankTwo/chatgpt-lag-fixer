@@ -3,47 +3,106 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>ChatGPT 卡顿修复</title>
+    <title>ChatGPT 长对话优化</title>
     <link rel="stylesheet" href="popup.css" />
   </head>
   <body>
-    <header class="header">
-      <h1>ChatGPT 卡顿修复</h1>
-    </header>
-
-    <main class="body">
-      <label class="row toggle-row">
-        <span>启用裁剪</span>
-        <input type="checkbox" id="enabled" />
-      </label>
-
-      <label class="row">
-        <span>保留最近轮数</span>
-        <span class="keep-value"><output id="keepValue">15</output></span>
-      </label>
-      <input type="range" id="keepTurns" min="4" max="60" step="1" value="15" class="slider" />
-
-      <label class="row toggle-row">
-        <span>调试日志</span>
-        <input type="checkbox" id="debug" />
-      </label>
-
-      <section class="status" id="status" hidden>
-        <div class="status-title">当前对话</div>
-        <div class="status-grid">
-          <div><span id="statRendered">–</span><small>已渲染</small></div>
-          <div><span id="statTotal">–</span><small>总计</small></div>
+    <div class="popup-shell">
+      <header class="header">
+        <div class="header-brand">
+          <img class="brand-icon" src="../icons/icon48.png" alt="" aria-hidden="true" />
+          <h1>ChatGPT 长对话优化</h1>
         </div>
-        <div class="status-note" id="statNote"></div>
-      </section>
+      </header>
 
-      <div class="reload-hint" id="reloadHint" hidden>
-        <span>改动需刷新页面后生效</span>
-        <button type="button" id="reloadBtn">刷新页面</button>
-      </div>
-    </main>
+      <main class="body">
+        <section class="section section-toggle">
+          <div class="setting-row">
+            <div class="setting-copy">
+              <span class="setting-title">启用优化</span>
+              <span class="setting-desc">智能裁剪历史消息，降低长对话页面负载</span>
+            </div>
+            <input class="switch" type="checkbox" id="enabled" aria-label="启用优化" />
+          </div>
+        </section>
 
-    <footer class="footer">完全本地 · 无账号 · 无遥测</footer>
+        <section class="section range-section">
+          <div class="section-title-row">
+            <span class="section-title">保留最近轮数</span>
+            <span class="help-dot" title="控制页面保留的最近可见轮次数量">?</span>
+          </div>
+
+          <div class="range-main">
+            <div class="range-left">
+              <input type="range" id="keepTurns" min="4" max="60" step="1" value="15" class="slider" />
+              <div class="range-scale" aria-hidden="true">
+                <span>4</span>
+                <span>8</span>
+                <span>16</span>
+                <span>32</span>
+                <span>60</span>
+              </div>
+            </div>
+            <output id="keepValue" class="keep-value">15</output>
+          </div>
+        </section>
+
+        <section class="section status-section">
+          <div class="section-title">优化状态</div>
+
+          <div class="status-card" id="status">
+            <div class="status-grid">
+              <div class="status-item">
+                <div class="status-label-row">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5.5h14a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H9l-4.5 3v-3H5a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2Z"/><circle cx="8" cy="11" r="1"/><circle cx="12" cy="11" r="1"/><circle cx="16" cy="11" r="1"/></svg>
+                  <span>当前保留</span>
+                </div>
+                <span class="stat-value" id="statRendered">–</span>
+                <small>轮对话</small>
+              </div>
+
+              <div class="status-item">
+                <div class="status-label-row">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 7V5.8c0-1 .8-1.8 1.8-1.8h4.4c1 0 1.8.8 1.8 1.8V7M5 7h14M7 7l.8 12h8.4L17 7M10 10v6M14 10v6"/></svg>
+                  <span>已裁剪</span>
+                </div>
+                <span class="stat-value" id="statTotal">–</span>
+                <small>个轮次</small>
+              </div>
+
+              <div class="status-item">
+                <div class="status-label-row">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 19 6v5.3c0 4.5-2.9 7.9-7 9.7-4.1-1.8-7-5.2-7-9.7V6l7-3Z"/><path d="m9 12 2 2 4-4"/></svg>
+                  <span>运行状态</span>
+                </div>
+                <span class="stat-value status-good" id="statHealth">良好</span>
+                <small>裁剪正常</small>
+              </div>
+            </div>
+
+            <div class="status-note" id="statNote">打开或刷新 ChatGPT 会话后显示优化状态。</div>
+          </div>
+        </section>
+
+        <section class="action-section">
+          <button type="button" id="reloadBtn" class="primary-action">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6v5h-5M4 18v-5h5"/><path d="M6.3 8.2A7 7 0 0 1 18.7 7L20 11M4 13l1.3 4A7 7 0 0 0 17.7 15.8"/></svg>
+            <span>立即优化</span>
+          </button>
+          <div class="action-status" id="reloadHint">当前设置已生效</div>
+        </section>
+
+        <section class="debug-section">
+          <div class="setting-row compact-row">
+            <div class="setting-copy">
+              <span class="setting-title">调试日志</span>
+              <span class="setting-desc">在控制台输出裁剪状态</span>
+            </div>
+            <input class="switch switch-small" type="checkbox" id="debug" aria-label="调试日志" />
+          </div>
+        </section>
+      </main>
+    </div>
 
     <script src="popup.js"></script>
   </body>

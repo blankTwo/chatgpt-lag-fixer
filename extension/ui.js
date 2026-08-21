@@ -10,6 +10,7 @@
 
   const BTN_ID = "clf-load-more";
   const KEY_EXTRA = "clf_extra_messages";
+  const KEY_LOAD_MORE_PENDING = "clf_load_more_pending";
   const KEY_STATUS = "clf_last_status";
   const STEP = 20; // 每次"加载更早"扩大的轮次预算
 
@@ -76,6 +77,11 @@
     btn.addEventListener("click", () => {
       const convId = convIdFromUrl(location.href);
       writeExtra(convId, currentExtra(convId) + STEP);
+      try {
+        sessionStorage.setItem(KEY_LOAD_MORE_PENDING, JSON.stringify({ convId, at: Date.now() }));
+      } catch (e) {
+        /* 忽略 */
+      }
       location.reload();
     });
     document.body.appendChild(btn);

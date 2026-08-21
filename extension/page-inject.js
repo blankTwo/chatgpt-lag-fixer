@@ -11,8 +11,32 @@
 
   const KEY_SETTINGS = "clf_settings";
   const KEY_CONFIG = "clf_config"; // 页面 localStorage 里的镜像键
-  const KEY_EXTRA = "clf_extra_messages"; // "加载更早"累积的额外预算（页面 localStorage）
+  const KEY_EXTRA = "clf_extra_messages"; // "加载更早"的一次性额外预算（页面 localStorage）
+  const KEY_LOAD_MORE_PENDING = "clf_load_more_pending"; // 仅允许显式“加载更早”的下一次 reload 继承 extra
+  const LOAD_MORE_TTL_MS = 15000;
   const DEFAULTS = { enabled: true, keepTurns: 15, debug: false };
+
+  function convIdFromUrl(url) {
+    const m = String(url).match(/\/c\/([^/?#]+)/);
+    return m ? decodeURIComponent(m[1]).toLowerCase() : null;
+  }
+
+  // extra 不能跨普通刷新长期残留。只有用户刚刚点击“加载更早”触发的那一次 reload 才保留。
+  // 否则旧 extra 会把 keepTurns=4 之类的设置悄悄放大成 24/44/...。
+  try {
+    const convId = convIdFromUrl(location.href);
+    const raw = sessionStorage.getItem(KEY_LOAD_MORE_PENDING);
+    let preserveExtra = false;
+    if (raw && convId) {
+      const pending = JSON.parse(raw);
+      preserveExtra = pending.convId === convId && Date.now() - Number(pending.at || 0) <= LOAD_MORE_TTL_MS;
+    }
+    sessionStorage.removeItem(KEY_LOAD_MORE_PENDING);
+    if (!preserveExtra) localStorage.removeItem(KEY_EXTRA);
+  } catch (e) {
+    try { sessionStorage.removeItem(KEY_LOAD_MORE_PENDING); } catch (_) { /* 忽略 */ }
+    try { localStorage.removeItem(KEY_EXTRA); } catch (_) { /* 忽略 */ }
+  }
 
   // 1. 暴露 wasm URL（以及扩展 id，便于调试）。
   try {
@@ -35,6 +59,7 @@
   function mirror(settings) {
     try {
       localStorage.setItem(KEY_CONFIG, JSON.stringify(normalize(settings)));
+      document.documentElement.dataset.clfConfigReady = "1";
     } catch (e) {
       /* 忽略 */
     }

@@ -1,12 +1,12 @@
-/* main-world.js — MAIN world，document_start，纯 IIFE（无 import，避开 CSP）
+/* main-world.js — MAIN world，document_start，纯 IIFE（无 import）
  *
- * 关键设计（吸取上一版教训）：
- *   1. 同步地、立刻挂钩 window.fetch —— 抢在 ChatGPT 首屏拉对话之前。
- *      wasm 是异步加载的；在它就绪之前，hook 会原样放行请求（只是暂不裁剪），
- *      绝不会因为"等 wasm"而漏装 hook。
- *   2. 不使用任何 import / 动态 import，因此不受 chatgpt.com 严格 CSP 影响。
- *   3. wasm 字符串封送使用与单测相同的 @assemblyscript/loader（vendor/as-loader.js
- *      已在本脚本之前注入，挂在 window.loader 上）。
+ * 重建版原则：
+ *   1. 只做一件事：拦截历史会话响应并用 WASM 裁剪数据。
+ *   2. 不处理 iframe，不做 DOM 虚拟化，不做 content-visibility，不拦 XHR。
+ *   3. 兼容两种历史接口：
+ *      - 旧版 /backend-api/conversation/<id>：mapping + current_node，直接 WASM。
+ *      - 新版 /backend-api/conversations/<id>：messages[] + current_node，先适配成 mapping，
+ *        WASM 决定保留节点，再映射回原 messages[]。
  */
 (() => {
   "use strict";
@@ -15,21 +15,19 @@
   const KEY_CONFIG = "clf_config";
   const KEY_EXTRA = "clf_extra_messages";
   const DEFAULTS = { enabled: true, keepTurns: 15, debug: false };
+  const WASM_WAIT_TIMEOUT = 3000;
+  const CONFIG_WAIT_TIMEOUT = 1200;
+  const BUILD_SIGNATURE = "core-rebuild-v1";
 
-  // ── wasm 状态 ────────────────────────────────────────────
-  let wasm = null;     // loader 实例的 exports
+  let wasm = null;
   let wasmReady = false;
-  // 首屏请求可能早于 wasm 加载完成。用一个 promise 让 fetch hook 能"等一下"
-  // wasm 就绪后再裁剪首屏对话（否则首屏会全量渲染，正是长对话打开时变慢的原因）。
   let resolveWasmReady;
-  const wasmReadyPromise = new Promise((res) => { resolveWasmReady = res; });
-  const WASM_WAIT_TIMEOUT = 3000; // 兜底：最多等 3s，wasm 万一加载失败也不卡住请求
+  const wasmReadyPromise = new Promise((resolve) => { resolveWasmReady = resolve; });
 
-  function log(cfg, ...a) {
-    if (cfg && cfg.debug) console.log("[CLF]", ...a);
+  function log(cfg, ...args) {
+    if (cfg?.debug) console.log("[CLF]", ...args);
   }
 
-  // ── 配置 / extra 读取（来自 page-inject 镜像的页面 localStorage）──
   function readConfig() {
     try {
       const raw = localStorage.getItem(KEY_CONFIG);
@@ -37,132 +35,141 @@
         const s = JSON.parse(raw);
         return {
           enabled: s.enabled ?? DEFAULTS.enabled,
-          keepTurns: Math.max(1, s.keepTurns ?? DEFAULTS.keepTurns),
+          keepTurns: Math.max(1, Math.floor(Number(s.keepTurns) || DEFAULTS.keepTurns)),
           debug: s.debug ?? DEFAULTS.debug,
         };
       }
-    } catch (e) {
+    } catch (_) {
       /* 忽略 */
     }
     return { ...DEFAULTS };
   }
 
-  function convIdFromUrl(url) {
-    const m = String(url).match(/\/c\/([^/?#]+)/);
+  function waitForConfigReady() {
+    if (document.documentElement.dataset.clfConfigReady === "1") return Promise.resolve(true);
+    return new Promise((resolve) => {
+      let finished = false;
+      const finish = (ready) => {
+        if (finished) return;
+        finished = true;
+        observer.disconnect();
+        clearTimeout(timer);
+        resolve(ready);
+      };
+      const observer = new MutationObserver(() => {
+        if (document.documentElement.dataset.clfConfigReady === "1") finish(true);
+      });
+      observer.observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ["data-clf-config-ready"],
+      });
+      const timer = setTimeout(() => finish(false), CONFIG_WAIT_TIMEOUT);
+    });
+  }
+
+  function convIdFromPage() {
+    const m = String(location.href).match(/\/c\/([^/?#]+)/);
     return m ? decodeURIComponent(m[1]).toLowerCase() : null;
+  }
+
+  function convIdFromApiUrl(url) {
+    try {
+      const path = new URL(String(url), location.origin).pathname;
+      const m = path.match(/^\/backend-api\/conversations?\/([^/]+)\/?$/);
+      return m ? decodeURIComponent(m[1]).toLowerCase() : null;
+    } catch (_) {
+      return null;
+    }
   }
 
   function readExtra(convId) {
     if (!convId) return 0;
     try {
       const raw = localStorage.getItem(KEY_EXTRA);
-      if (raw) {
-        const p = JSON.parse(raw);
-        if (p.convId === convId) return p.extra || 0;
-      }
-    } catch (e) {
-      /* 忽略 */
+      if (!raw) return 0;
+      const parsed = JSON.parse(raw);
+      return parsed.convId === convId ? Math.max(0, Number(parsed.extra) || 0) : 0;
+    } catch (_) {
+      return 0;
     }
-    return 0;
   }
 
   function postStatus(payload) {
     window.postMessage({ source: "clf", type: "clf-status", payload }, "*");
   }
 
-  // ── wasm 加载（异步，不阻塞 hook 安装）────────────────────
   async function loadWasm() {
     try {
       const url = document.documentElement.dataset.clfWasmUrl;
-      if (!url) {
-        console.error("[CLF] 未找到 wasm URL（page-inject 未运行？）");
-        return;
-      }
-      if (!window.loader) {
-        console.error("[CLF] as-loader 未加载（vendor/as-loader.js 未注入？）");
-        return;
-      }
+      if (!url) throw new Error("未找到 wasm URL（page-inject 未就绪）");
+      if (!window.loader) throw new Error("as-loader 未加载");
+
       const bytes = await (await fetch(url)).arrayBuffer();
       const mod = await window.loader.instantiate(bytes, {
         env: {
-          abort(_m, _f, line, col) {
-            console.error("[CLF] wasm abort，位置 " + line + ":" + col);
+          abort(_message, _file, line, col) {
+            console.error(`[CLF] wasm abort，位置 ${line}:${col}`);
           },
         },
       });
       wasm = mod.exports;
       wasmReady = true;
-      const c = readConfig();
-      log(c, "wasm 已就绪 → 启用裁剪:", c.enabled, "| 保留最近轮数:", c.keepTurns, "| 调试:", c.debug);
-    } catch (e) {
-      console.error("[CLF] 加载 wasm 失败:", e);
+      const cfg = readConfig();
+      log(
+        cfg,
+        "wasm 已就绪 → 启用裁剪:", cfg.enabled,
+        "| 保留最近轮数:", cfg.keepTurns,
+        "| 调试:", cfg.debug,
+      );
+    } catch (error) {
+      console.error("[CLF] 加载 wasm 失败:", error);
     } finally {
-      // 无论成功失败都要 resolve，让等待首屏的 fetch hook 能继续（失败时按不裁剪放行）。
-      if (resolveWasmReady) resolveWasmReady();
+      resolveWasmReady?.();
     }
   }
 
-  // 喂给 wasm 前精简 mapping：只保留结构与 role/hidden，丢掉消息正文等无关字段。
-  // wasm 的裁剪算法只看这几个字段，长对话下这一步能把传入 wasm 的 JSON 从数 MB
-  // 降到几十 KB，显著减少 stringify / 内存拷贝 / wasm 内 JSON 解析的开销（首屏更快）。
   function slimForWasm(convObj) {
     const src = convObj.mapping;
     const out = {};
-    const keys = Object.keys(src);
-    for (let i = 0; i < keys.length; i++) {
-      const id = keys[i];
+    for (const id of Object.keys(src || {})) {
       const node = src[id];
       if (!node) continue;
-      const slim = { parent: node.parent != null ? node.parent : null };
-      if (Array.isArray(node.children)) slim.children = node.children;
+      const slim = {
+        parent: node.parent != null ? node.parent : null,
+        children: Array.isArray(node.children) ? node.children : [],
+      };
       const msg = node.message;
       if (msg) {
-        const m = { author: { role: msg.author ? msg.author.role : undefined } };
-        const meta = msg.metadata;
-        if (meta && meta.is_visually_hidden_from_conversation != null) {
-          m.metadata = { is_visually_hidden_from_conversation: meta.is_visually_hidden_from_conversation };
+        const role = msg.author?.role;
+        const compact = { author: { role } };
+        if (msg.metadata?.is_visually_hidden_from_conversation != null) {
+          compact.metadata = {
+            is_visually_hidden_from_conversation:
+              msg.metadata.is_visually_hidden_from_conversation,
+          };
         }
-        slim.message = m;
+        slim.message = compact;
       }
       out[id] = slim;
     }
     return { mapping: out, current_node: convObj.current_node };
   }
 
-  // ── 裁剪单个对话对象；无需/不可裁剪时返回 null ────────────
   function trim(convObj, keepTurns, extra) {
-    if (!wasmReady) return null;
-    const json = JSON.stringify(slimForWasm(convObj));
-    const ptr = wasm.__newString(json);
+    if (!wasmReady || !convObj?.mapping || !convObj?.current_node) return null;
+    const ptr = wasm.__newString(JSON.stringify(slimForWasm(convObj)));
     wasm.__pin(ptr);
     try {
       const outPtr = wasm.trimConversation(ptr, keepTurns, extra);
-      if (outPtr === 0) return null;
+      if (!outPtr) return null;
       const out = wasm.__getString(outPtr);
-      if (!out) return null;
-      return JSON.parse(out);
-    } catch (e) {
-      console.error("[CLF] wasm 裁剪出错:", e);
+      return out ? JSON.parse(out) : null;
+    } catch (error) {
+      console.error("[CLF] wasm 裁剪出错:", error);
       return null;
     } finally {
       wasm.__unpin(ptr);
     }
-  }
-
-  // ── 把 wasm 裁剪结果合并回原始对话（保留完整 message 负载）──
-  function applyTrim(original, result) {
-    const mapping = {};
-    for (const id of Object.keys(result.mapping)) {
-      const tn = result.mapping[id];
-      const on = original.mapping ? original.mapping[id] : undefined;
-      mapping[id] = {
-        id,
-        message: on ? on.message ?? null : null,
-        parent: tn.parent ?? null,
-        children: Array.isArray(tn.children) ? tn.children : [],
-      };
-    }
-    return { ...original, mapping, current_node: result.current_node };
   }
 
   function makeResponse(original, bodyObj) {
@@ -170,65 +177,58 @@
     headers.delete("content-length");
     headers.delete("content-encoding");
     headers.set("content-type", "application/json; charset=utf-8");
-    const res = new Response(JSON.stringify(bodyObj), {
+    const response = new Response(JSON.stringify(bodyObj), {
       status: original.status,
       statusText: original.statusText,
       headers,
     });
     try {
-      Object.defineProperty(res, "url", { value: original.url });
-    } catch (e) {
-      /* 某些环境 url 只读，忽略 */
+      Object.defineProperty(response, "url", { value: original.url });
+    } catch (_) {
+      /* 忽略 */
     }
-    return res;
+    return response;
   }
 
-  function isConversationGet(url, method) {
-    return (
-      method === "GET" &&
-      url.indexOf("/backend-api/conversation") !== -1 &&
-      url.indexOf("/backend-api/conversations") === -1
-    );
+  function requestKind(url, method) {
+    if (method !== "GET") return "other";
+    try {
+      const path = new URL(String(url), location.origin).pathname;
+      if (/^\/backend-api\/conversation\/[^/]+\/?$/.test(path)) return "legacy";
+      if (/^\/backend-api\/conversations\/[^/]+\/?$/.test(path)) return "current";
+      return "other";
+    } catch (_) {
+      return "other";
+    }
   }
 
-  async function processResponse(response, cfg) {
-    let text;
+  function applyLegacyTrim(original, result) {
+    const mapping = {};
+    for (const id of Object.keys(result.mapping || {})) {
+      const trimmed = result.mapping[id];
+      const source = original.mapping?.[id];
+      mapping[id] = {
+        ...(source || {}),
+        id: source?.id ?? id,
+        message: source?.message ?? null,
+        parent: trimmed.parent ?? null,
+        children: Array.isArray(trimmed.children) ? trimmed.children : [],
+      };
+    }
+    return { ...original, mapping, current_node: result.current_node };
+  }
+
+  async function processLegacy(response, cfg, convId, extra) {
+    let body;
     try {
-      text = await response.clone().text();
-    } catch (e) {
+      body = await response.clone().json();
+    } catch (_) {
       return response;
     }
-    if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+    if (!body?.mapping || !body?.current_node) return response;
 
-    let conv;
-    try {
-      conv = JSON.parse(text);
-    } catch (e) {
-      return response;
-    }
-    if (!conv || !conv.mapping || !conv.current_node) return response;
-
-    const convId =
-      convIdFromUrl(location.href) ||
-      (conv.conversation_id ? String(conv.conversation_id).toLowerCase() : null);
-    const extra = readExtra(convId);
-
-    const budget = cfg.keepTurns + extra;
-    log(
-      cfg,
-      "当前配置 →",
-      "启用裁剪:", cfg.enabled,
-      "| 保留最近轮数(keepTurns):", cfg.keepTurns,
-      "| 加载更早(extra):", extra,
-      "| 实际预算(budget=keepTurns+extra):", budget,
-      "| 会话:", convId
-    );
-
-    const result = trim(conv, cfg.keepTurns, extra);
-    if (!result) {
-      log(cfg, "跳过裁剪（无需裁剪或 wasm 未就绪）");
-      return response;
-    }
+    const result = trim(body, cfg.keepTurns, extra);
+    if (!result) return response;
 
     postStatus({
       conversationId: convId,
@@ -239,52 +239,285 @@
       extra,
     });
 
+    log(
+      cfg,
+      "WASM 已裁剪 →",
+      result.visibleTotal, "->", result.visibleKept,
+      "个可见轮次 | endpoint: legacy",
+    );
+
     if (!result.hasOlderMessages) return response;
+    return makeResponse(response, applyLegacyTrim(body, result));
+  }
+
+  function itemId(item, index) {
+    const value = item?.id ?? item?.message?.id ?? item?.message_id ?? item?.node_id;
+    return value == null ? `__clf_msg_${index}` : String(value);
+  }
+
+  function itemMessage(item) {
+    if (item?.message && typeof item.message === "object") return item.message;
+    if (item?.author || item?.role || item?.metadata) return item;
+    return null;
+  }
+
+  function itemParent(item) {
+    const value = item?.parent ?? item?.parent_id ?? item?.parentId ?? null;
+    if (value && typeof value === "object") {
+      return value.id ?? value.message_id ?? null;
+    }
+    return value == null ? null : String(value);
+  }
+
+  function buildCurrentAdapter(messages, currentNode) {
+    const rootId = "__clf_root__";
+    const syntheticIds = [];
+    const actualIds = [];
+    const actualToSynthetic = new Map();
+    const syntheticToActual = new Map();
+    const used = new Set([rootId]);
+
+    for (let i = 0; i < messages.length; i++) {
+      const actual = itemId(messages[i], i);
+      let synthetic = actual;
+      if (used.has(synthetic)) synthetic = `__clf_msg_${i}`;
+      let suffix = 1;
+      while (used.has(synthetic)) synthetic = `__clf_msg_${i}_${suffix++}`;
+      used.add(synthetic);
+      syntheticIds.push(synthetic);
+      actualIds.push(actual);
+      if (!actualToSynthetic.has(actual)) actualToSynthetic.set(actual, synthetic);
+      syntheticToActual.set(synthetic, actual);
+    }
+
+    const parents = new Array(messages.length);
+    const hasTreeRelations = messages.some((item) =>
+      itemParent(item) != null ||
+      Array.isArray(item?.children) ||
+      Array.isArray(item?.children_ids)
+    );
+    for (let i = 0; i < messages.length; i++) {
+      const rawParent = itemParent(messages[i]);
+      const mappedParent = rawParent != null ? actualToSynthetic.get(String(rawParent)) : null;
+      if (mappedParent) parents[i] = mappedParent;
+      else if (hasTreeRelations) parents[i] = rootId;
+      else parents[i] = i === 0 ? rootId : syntheticIds[i - 1];
+    }
+
+    const childrenById = new Map([[rootId, []]]);
+    for (const id of syntheticIds) childrenById.set(id, []);
+    for (let i = 0; i < syntheticIds.length; i++) {
+      const parent = parents[i] || rootId;
+      const children = childrenById.get(parent) || [];
+      children.push(syntheticIds[i]);
+      childrenById.set(parent, children);
+    }
+
+    const mapping = {
+      [rootId]: { parent: null, children: childrenById.get(rootId) || [], message: null },
+    };
+    for (let i = 0; i < messages.length; i++) {
+      mapping[syntheticIds[i]] = {
+        parent: parents[i] || rootId,
+        children: childrenById.get(syntheticIds[i]) || [],
+        message: itemMessage(messages[i]),
+      };
+    }
+
+    const wantedCurrent = currentNode == null ? null : String(currentNode);
+    const currentSynthetic =
+      (wantedCurrent && actualToSynthetic.get(wantedCurrent)) ||
+      syntheticIds[syntheticIds.length - 1] ||
+      rootId;
+
+    return {
+      conversation: { mapping, current_node: currentSynthetic },
+      rootId,
+      syntheticIds,
+      actualIds,
+      syntheticToActual,
+    };
+  }
+
+  function patchCurrentItem(item, trimmedNode, adapter) {
+    if (!item || typeof item !== "object") return item;
+    const hasTreeFields = ["parent", "parent_id", "parentId", "children", "children_ids"]
+      .some((key) => Object.prototype.hasOwnProperty.call(item, key));
+    if (!hasTreeFields) return item;
+
+    const out = { ...item };
+    const parentSynthetic = trimmedNode.parent;
+    const parentActual =
+      !parentSynthetic || parentSynthetic === adapter.rootId
+        ? null
+        : adapter.syntheticToActual.get(parentSynthetic) ?? null;
+    const childrenActual = (trimmedNode.children || [])
+      .filter((id) => id !== adapter.rootId)
+      .map((id) => adapter.syntheticToActual.get(id))
+      .filter(Boolean);
+
+    if (Object.prototype.hasOwnProperty.call(item, "parent")) out.parent = parentActual;
+    if (Object.prototype.hasOwnProperty.call(item, "parent_id")) out.parent_id = parentActual;
+    if (Object.prototype.hasOwnProperty.call(item, "parentId")) out.parentId = parentActual;
+    if (Object.prototype.hasOwnProperty.call(item, "children")) out.children = childrenActual;
+    if (Object.prototype.hasOwnProperty.call(item, "children_ids")) out.children_ids = childrenActual;
+    return out;
+  }
+
+  function rewriteCurrentRequest(args, url, minimumTurns) {
+    const parsed = new URL(String(url), location.origin);
+    const current = Math.max(0, Number(parsed.searchParams.get("num_turns")) || 0);
+    const next = Math.max(current, Math.max(1, Math.floor(minimumTurns)));
+    if (next === current) return { args, requestedTurns: current || null };
+
+    parsed.searchParams.set("num_turns", String(next));
+    const nextArgs = args.slice();
+    const input = args[0];
+    nextArgs[0] = input instanceof Request
+      ? new Request(parsed.href, input)
+      : parsed.href;
+    return { args: nextArgs, requestedTurns: next };
+  }
+
+  async function processCurrent(response, cfg, convId, extra) {
+    let body;
+    try {
+      body = await response.clone().json();
+    } catch (_) {
+      return response;
+    }
+
+    const messages = Array.isArray(body?.messages) ? body.messages : null;
+    if (!messages || !body?.current_node) {
+      log(cfg, "新版历史响应结构不支持裁剪");
+      return response;
+    }
+
+    const adapter = buildCurrentAdapter(messages, body.current_node);
+    const result = trim(adapter.conversation, cfg.keepTurns, extra);
+    if (!result) return response;
+
+    const keep = new Set(Object.keys(result.mapping || {}));
+    const filtered = [];
+    const keptActualIds = [];
+
+    for (let i = 0; i < messages.length; i++) {
+      const syntheticId = adapter.syntheticIds[i];
+      if (!keep.has(syntheticId)) continue;
+      const trimmedNode = result.mapping[syntheticId];
+      filtered.push(patchCurrentItem(messages[i], trimmedNode, adapter));
+      keptActualIds.push(adapter.actualIds[i]);
+    }
+
+    const serverHasPreviousPage = Boolean(body?.page_info?.has_previous_page);
+    const hasOlderMessages = Boolean(result.hasOlderMessages || serverHasPreviousPage);
+    const lastActualId = keptActualIds[keptActualIds.length - 1] || body.current_node;
+    const currentNode = keptActualIds.includes(String(body.current_node))
+      ? body.current_node
+      : lastActualId;
+
+    let pageInfo = body.page_info;
+    if (pageInfo && typeof pageInfo === "object") {
+      pageInfo = { ...pageInfo };
+      if (keptActualIds.length) {
+        pageInfo.start_cursor = keptActualIds[0];
+        pageInfo.end_cursor = keptActualIds[keptActualIds.length - 1];
+      }
+      // 固定窗口由扩展控制；“加载更早”通过 extra + reload 显式扩大窗口。
+      pageInfo.has_previous_page = false;
+    }
+
+    postStatus({
+      conversationId: convId,
+      visibleTotal: result.visibleTotal,
+      visibleKept: result.visibleKept,
+      absoluteMessageCount: result.absoluteMessageCount,
+      hasOlderMessages,
+      extra,
+    });
 
     log(
       cfg,
-      "已裁剪 " + result.visibleTotal + " -> " + result.visibleKept +
-        " 个可见轮次（预算 " + budget + " = keepTurns " + cfg.keepTurns + " + extra " + extra + "）"
+      "WASM 已裁剪 →",
+      result.visibleTotal, "->", result.visibleKept,
+      "个可见轮次 | messages:", messages.length, "->", filtered.length,
+      "| endpoint: current",
+      "| 原生上一页:", serverHasPreviousPage ? "blocked" : "none",
     );
-    return makeResponse(response, applyTrim(conv, result));
+
+    const mustRebuild =
+      filtered.length !== messages.length ||
+      serverHasPreviousPage ||
+      currentNode !== body.current_node;
+    if (!mustRebuild) return response;
+
+    return makeResponse(response, {
+      ...body,
+      messages: filtered,
+      current_node: currentNode,
+      ...(pageInfo ? { page_info: pageInfo } : {}),
+    });
   }
 
-  // ── 同步安装 fetch hook（最先执行的关键动作）──────────────
   const originalFetch = window.fetch;
   window.fetch = async function (...args) {
     const input = args[0];
     const init = args[1];
     const url = input instanceof Request ? input.url : String(input);
     const method = (
-      (init && init.method) || (input instanceof Request ? input.method : "GET")
+      (init?.method) ||
+      (input instanceof Request ? input.method : "GET")
     ).toUpperCase();
+    const kind = requestKind(url, method);
 
-    const cfg = readConfig();
-    if (!cfg.enabled || !isConversationGet(url, method)) {
-      return originalFetch.apply(this, args);
-    }
+    if (kind === "other") return originalFetch.apply(this, args);
 
-    // 首屏关键点：这是对话请求但 wasm 还没就绪时，先等它（带超时兜底），
-    // 这样首屏就能裁剪，而不是全量渲染后再等下一次请求。与原扩展对齐。
+    await waitForConfigReady();
+    let cfg = readConfig();
+    if (!cfg.enabled) return originalFetch.apply(this, args);
+
     if (!wasmReady) {
-      log(cfg, "首屏对话请求，等待 wasm 就绪…");
+      log(cfg, "历史会话请求等待 wasm 就绪…");
       await Promise.race([
         wasmReadyPromise,
-        new Promise((res) => setTimeout(res, WASM_WAIT_TIMEOUT)),
+        new Promise((resolve) => setTimeout(resolve, WASM_WAIT_TIMEOUT)),
       ]);
     }
 
-    const response = await originalFetch.apply(this, args);
+    cfg = readConfig();
+    if (!cfg.enabled) return originalFetch.apply(this, args);
+
+    const convId = convIdFromApiUrl(url) || convIdFromPage();
+    const extra = readExtra(convId);
+    const budget = cfg.keepTurns + extra;
+
+    log(
+      cfg,
+      "命中历史会话请求 →",
+      "endpoint:", kind,
+      "| keepTurns:", cfg.keepTurns,
+      "| extra:", extra,
+      "| budget:", budget,
+      "| 会话:", convId,
+    );
+
+    let requestArgs = args;
+    if (kind === "current") {
+      requestArgs = rewriteCurrentRequest(args, url, budget).args;
+    }
+
+    const response = await originalFetch.apply(this, requestArgs);
     try {
-      return await processResponse(response, cfg);
-    } catch (e) {
-      log(cfg, "处理响应出错:", e);
+      return kind === "legacy"
+        ? await processLegacy(response, cfg, convId, extra)
+        : await processCurrent(response, cfg, convId, extra);
+    } catch (error) {
+      log(cfg, "处理历史响应失败，原样放行:", error);
       return response;
     }
   };
-  window.__CLF_PATCHED__ = true;
-  console.log("[CLF] fetch hook 已安装（MAIN world）");
 
-  // hook 装好后再异步加载 wasm。
+  window.__CLF_PATCHED__ = true;
+  console.log("[CLF] fetch hook 已安装（MAIN world）| core:", BUILD_SIGNATURE);
   loadWasm();
 })();
